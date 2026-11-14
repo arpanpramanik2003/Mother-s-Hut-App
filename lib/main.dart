@@ -455,22 +455,19 @@ class _WebViewScreenState extends State<WebViewScreen> {
       final results = await Connectivity().checkConnectivity();
       final isConnected = results.any((r) => r != ConnectivityResult.none);
       if (!isConnected) {
-        // Attempt to render the saved home page from local storage
-        final loaded = await _tryLoadOfflineHomePage();
-        if (!loaded) {
-          // Fallback to error UI only if no saved copy exists yet
-          hasErrorNotifier.value = true;
-          isLoadingNotifier.value = false;
-          if (isInitialLoadNotifier.value) {
-            isInitialLoadNotifier.value = false;
-          }
-        }
+        // Cold start with no internet: IMMEDIATELY show the proper offline warning interface!
+        debugPrint("Mother's Hut: Cold start offline -> Showing proper offline warning interface");
+        hasErrorNotifier.value = true;
+        isLoadingNotifier.value = false;
+        isInitialLoadNotifier.value = false;
       } else {
-        isOfflineModeNotifier.value = false;
+        hasErrorNotifier.value = false;
         controller.loadRequest(Uri.parse(websiteUrl));
       }
     } catch (e) {
-      controller.loadRequest(Uri.parse(websiteUrl));
+      hasErrorNotifier.value = true;
+      isLoadingNotifier.value = false;
+      isInitialLoadNotifier.value = false;
     }
   }
 
@@ -482,10 +479,21 @@ class _WebViewScreenState extends State<WebViewScreen> {
         (result) => result != ConnectivityResult.none,
       );
 
-      // Smart Cloud Sync: Auto-synchronize with live cloud when connectivity is restored
-      if (isConnected &&
-          (hasErrorNotifier.value || isOfflineModeNotifier.value)) {
-        _syncWithCloud();
+      if (!isConnected) {
+        // Sudden disconnect while within app: IMMEDIATELY show proper offline warning interface!
+        // Prevents Chromium's ugly default browser error page
+        debugPrint("Mother's Hut: Internet disconnected -> Showing proper offline warning interface");
+        hasErrorNotifier.value = true;
+        isLoadingNotifier.value = false;
+        if (isInitialLoadNotifier.value) {
+          isInitialLoadNotifier.value = false;
+        }
+      } else {
+        // Connection restored: Automatically recover live site and sync with cloud!
+        debugPrint("Mother's Hut: Connection restored -> Auto-syncing with cloud");
+        if (hasErrorNotifier.value || isOfflineModeNotifier.value) {
+          _syncWithCloud();
+        }
       }
     });
   }
@@ -605,9 +613,41 @@ class _WebViewScreenState extends State<WebViewScreen> {
             // Bridge target="_blank", window.open, location hook, and clipboard
             _injectWindowBridge();
 
-            // When the live homepage finishes loading, capture a fresh offline snapshot
-            if (!isOfflineModeNotifier.value &&
-                (url == websiteUrl || url == '$websiteUrl/')) {
+            // Cloud sync notification feedback
+            if (_wasOffline) {
+              _wasOffline = false;
+              if (mounted) {
+                ScaffoldMessenger.of(context).clearSnackBars();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: const Row(
+                      children: [
+                        Icon(Icons.cloud_done_rounded, color: Color(0xFF4CAF50), size: 18),
+                        SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            'Synchronized with Mother\'s Hut live cloud.',
+                            style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                      ],
+                    ),
+                    backgroundColor: const Color(0xFF1E293B),
+                    duration: const Duration(seconds: 3),
+                    behavior: SnackBarBehavior.floating,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                  ),
+                );
+              }
+            }
+
+            // When the live homepage finishes loading, capture an updated offline snapshot
+            final uri = Uri.tryParse(url);
+            final isHome = uri != null && (uri.path.isEmpty || uri.path == '/' || uri.path == '/home');
+            if (!isOfflineModeNotifier.value && isHome) {
               _saveHomePageSnapshot();
             }
           },
@@ -617,19 +657,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
               "Mother's Hut onWebResourceError: [${error.errorCode}] ${error.description} (isForMainFrame: ${error.isForMainFrame})",
             );
 
-            // GUARD 1: If already in offline mode, completely ignore all subresource network errors!
-            // This eliminates the infinite reload/flickering loop.
-            if (isOfflineModeNotifier.value) return;
-
-            // GUARD 2: ONLY react if the failure is on the main navigation frame!
-            // Subresources (images, analytics, fonts) must NEVER trigger a full page reload!
-            if (error.isForMainFrame != true) return;
-
-            // Main frame navigation failed (device is offline)
-            final loaded = await _tryLoadOfflineHomePage();
-            if (!loaded) {
+            // If main navigation frame fails due to network disconnection or timeout:
+            // Immediately show the proper warning interface instead of Chromium's default error page!
+            if (error.isForMainFrame == true) {
               isLoadingNotifier.value = false;
               hasErrorNotifier.value = true;
+              if (isInitialLoadNotifier.value) {
+                isInitialLoadNotifier.value = false;
+              }
             }
           },
 
@@ -874,9 +909,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
       final isConnected = results.any((r) => r != ConnectivityResult.none);
 
       if (!isConnected) {
-        // Attempt to render the saved home page if offline
-        final loaded = await _tryLoadOfflineHomePage();
-        if (!loaded && mounted) {
+        if (mounted) {
           ScaffoldMessenger.of(context).clearSnackBars();
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
