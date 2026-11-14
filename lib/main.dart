@@ -95,6 +95,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
   final ValueNotifier<bool> hasErrorNotifier = ValueNotifier<bool>(false);
   final ValueNotifier<bool> isRetryingNotifier = ValueNotifier<bool>(false);
   final ValueNotifier<bool> isOfflineModeNotifier = ValueNotifier<bool>(false);
+  bool _wasOffline = false;
 
   DateTime? _lastBackPressed;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
@@ -168,77 +169,137 @@ class _WebViewScreenState extends State<WebViewScreen> {
     }
   }
 
-  /// Captures the rendered DOM of the home page, strips scripts/ads/popups, and persists it to local phone storage
+  /// Captures the rendered DOM of the live home page, inlines all CSS stylesheets and images,
+  /// strips dynamic scripts and floating promo popups, and persists it to local phone storage
   Future<void> _saveHomePageSnapshot() async {
     try {
       // Delay slightly so dynamic React/Vue/carousels finish mounting
-      await Future.delayed(const Duration(milliseconds: 1500));
+      await Future.delayed(const Duration(milliseconds: 2000));
       if (!mounted) return;
 
       final dynamic htmlResult = await controller.runJavaScriptReturningResult(
         '''
         (function() {
-          var clone = document.documentElement.cloneNode(true);
-          
-          // 1. Remove all executable <script> tags to prevent React/JS hydration crashes and DOM wipes offline
-          var scripts = clone.querySelectorAll('script');
-          for (var s = 0; s < scripts.length; s++) {
-            scripts[s].remove();
-          }
-
-          // 2. Remove floating advertisement cards, promo banners, modals, popups, and overlays
-          var adSelectors = [
-            '[class*="modal"]',
-            '[class*="popup"]',
-            '[class*="dialog"]',
-            '[class*="advertisement"]',
-            '[class*="promo"]',
-            '[class*="floating"]',
-            '[class*="banner-ad"]',
-            '[class*="ad-banner"]',
-            '[class*="backdrop"]',
-            '[class*="overlay"]',
-            '[id*="modal"]',
-            '[id*="popup"]',
-            '[id*="dialog"]',
-            '[id*="advertisement"]',
-            '[id*="promo"]',
-            '[id*="floating"]',
-            '[role="dialog"]',
-            '[role="alertdialog"]',
-            '.swal2-container'
-          ];
-          
-          adSelectors.forEach(function(sel) {
+          try {
+            var clone = document.documentElement.cloneNode(true);
+            
+            // 1. Inlining all live CSS stylesheets into a single <style> tag so it renders offline without network
+            var allStyles = '';
             try {
-              var elements = clone.querySelectorAll(sel);
-              for (var i = 0; i < elements.length; i++) {
-                var el = elements[i];
-                var tag = el.tagName.toLowerCase();
-                if (tag !== 'header' && tag !== 'nav' && tag !== 'footer' && tag !== 'body' && tag !== 'html') {
-                  el.remove();
+              for (var i = 0; i < document.styleSheets.length; i++) {
+                var sheet = document.styleSheets[i];
+                try {
+                  var rules = sheet.cssRules || sheet.rules;
+                  if (rules) {
+                    for (var r = 0; r < rules.length; r++) {
+                      allStyles += rules[r].cssText + '\\n';
+                    }
+                  }
+                } catch(e) {}
+              }
+            } catch(e) {}
+
+            // Remove external stylesheet link tags so Chromium doesn't stall waiting for DNS offline
+            var links = clone.querySelectorAll('link[rel="stylesheet"], link[rel="preload"], link[rel="prefetch"]');
+            for (var l = 0; l < links.length; l++) {
+              links[l].remove();
+            }
+
+            // Append inlined CSS rules into the clone head
+            var styleTag = document.createElement('style');
+            styleTag.id = 'mh-inlined-live-styles';
+            styleTag.innerHTML = allStyles;
+            var head = clone.querySelector('head') || clone.querySelector('body');
+            if (head) {
+              head.appendChild(styleTag);
+            }
+
+            // 2. Inlining images into base64 data URIs so dishes & logos display offline
+            try {
+              var origImgs = document.images;
+              var cloneImgs = clone.querySelectorAll('img');
+              for (var m = 0; m < origImgs.length && m < cloneImgs.length; m++) {
+                var orig = origImgs[m];
+                if (orig && orig.complete && orig.naturalWidth > 0 && orig.naturalWidth < 1400) {
+                  try {
+                    var canvas = document.createElement('canvas');
+                    canvas.width = orig.naturalWidth;
+                    canvas.height = orig.naturalHeight;
+                    var ctx = canvas.getContext('2d');
+                    ctx.drawImage(orig, 0, 0);
+                    var dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+                    if (dataUrl && dataUrl.length > 50) {
+                      cloneImgs[m].setAttribute('src', dataUrl);
+                      cloneImgs[m].removeAttribute('srcset');
+                      cloneImgs[m].removeAttribute('loading');
+                    }
+                  } catch(e) {}
                 }
               }
             } catch(e) {}
-          });
 
-          // 3. Remove fixed floating overlays with high z-index
-          try {
-            var allDivs = clone.querySelectorAll('div, section, aside');
-            for (var j = 0; j < allDivs.length; j++) {
-              var d = allDivs[j];
-              var style = d.getAttribute('style') || '';
-              if ((style.includes('position: fixed') || style.includes('position:fixed')) &&
-                  (style.includes('z-index') || style.includes('z-index:'))) {
-                var tag = d.tagName.toLowerCase();
-                if (tag !== 'header' && tag !== 'nav' && tag !== 'footer') {
-                  d.remove();
+            // 3. Remove all executable <script> tags to prevent React/JS hydration crashes and DOM wipes offline
+            var scripts = clone.querySelectorAll('script');
+            for (var s = 0; s < scripts.length; s++) {
+              scripts[s].remove();
+            }
+
+            // 4. Remove floating advertisement cards, promo banners, modals, popups, and overlays
+            var adSelectors = [
+              '[class*="modal"]',
+              '[class*="popup"]',
+              '[class*="dialog"]',
+              '[class*="advertisement"]',
+              '[class*="promo"]',
+              '[class*="floating"]',
+              '[class*="banner-ad"]',
+              '[class*="ad-banner"]',
+              '[class*="backdrop"]',
+              '[class*="overlay"]',
+              '[id*="modal"]',
+              '[id*="popup"]',
+              '[id*="dialog"]',
+              '[id*="advertisement"]',
+              '[id*="promo"]',
+              '[id*="floating"]',
+              '[role="dialog"]',
+              '[role="alertdialog"]',
+              '.swal2-container'
+            ];
+            
+            adSelectors.forEach(function(sel) {
+              try {
+                var elements = clone.querySelectorAll(sel);
+                for (var i = 0; i < elements.length; i++) {
+                  var el = elements[i];
+                  var tag = el.tagName.toLowerCase();
+                  if (tag !== 'header' && tag !== 'nav' && tag !== 'footer' && tag !== 'body' && tag !== 'html') {
+                    el.remove();
+                  }
+                }
+              } catch(e) {}
+            });
+
+            // 5. Remove fixed floating overlays with high z-index
+            try {
+              var allDivs = clone.querySelectorAll('div, section, aside');
+              for (var j = 0; j < allDivs.length; j++) {
+                var d = allDivs[j];
+                var style = d.getAttribute('style') || '';
+                if ((style.includes('position: fixed') || style.includes('position:fixed')) &&
+                    (style.includes('z-index') || style.includes('z-index:'))) {
+                  var tag = d.tagName.toLowerCase();
+                  if (tag !== 'header' && tag !== 'nav' && tag !== 'footer') {
+                    d.remove();
+                  }
                 }
               }
-            }
-          } catch(e) {}
+            } catch(e) {}
 
-          return clone.outerHTML;
+            return clone.outerHTML;
+          } catch(err) {
+            return document.documentElement.outerHTML;
+          }
         })();
       ''',
       );
@@ -259,7 +320,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
         if (file != null) {
           await file.writeAsString(html, flush: true);
           debugPrint(
-            "Mother's Hut: Clean home page snapshot saved locally (${html.length} bytes, scripts/popups removed)",
+            "Mother's Hut: Clean home page snapshot saved locally (${html.length} bytes, CSS inlined, popups removed)",
           );
         }
       }
@@ -291,12 +352,12 @@ class _WebViewScreenState extends State<WebViewScreen> {
                 <span style="font-size:15px;">⚡</span>
                 <span>Offline, please turn on internet</span>
               </div>
-              <button onclick="if(window.MothersHutActionBridge) window.MothersHutActionBridge.postMessage('openWirelessSettings')" style="background:#ffffff; color:#8B4513; border:none; border-radius:6px; padding:5px 11px; font-size:11px; font-weight:700; cursor:pointer;">
+              <button id="mh-offline-bar-btn" onclick="if(window.MothersHutActionBridge) window.MothersHutActionBridge.postMessage('openWirelessSettings')" style="background:#ffffff; color:#8B4513; border:none; border-radius:6px; padding:5px 11px; font-size:11px; font-weight:700; cursor:pointer;">
                 Turn On Internet
               </button>
             </div>
             <style>
-              body { padding-top: 44px !important; }
+              body { padding-top: 48px !important; }
               [class*="modal"], [class*="popup"], [class*="dialog"], [class*="advertisement"], [class*="promo"], [class*="backdrop"], [class*="overlay"], [id*="modal"], [id*="popup"], [id*="advertisement"] {
                 display: none !important;
                 visibility: hidden !important;
@@ -333,12 +394,15 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
           isOfflineModeNotifier.value = true;
           hasErrorNotifier.value = false;
+
+          // Load with baseUrl: 'about:blank' so Chromium NEVER makes network calls for CSS/DNS
+          await controller.loadHtmlString(html, baseUrl: 'about:blank');
+
           isLoadingNotifier.value = false;
           if (isInitialLoadNotifier.value) {
             isInitialLoadNotifier.value = false;
           }
 
-          await controller.loadHtmlString(html, baseUrl: websiteUrl);
           debugPrint(
             "Mother's Hut: Rendered clean saved local home page in offline mode!",
           );
@@ -418,14 +482,57 @@ class _WebViewScreenState extends State<WebViewScreen> {
         (result) => result != ConnectivityResult.none,
       );
 
-      // Auto-recover live site when connectivity is restored
+      // Smart Cloud Sync: Auto-synchronize with live cloud when connectivity is restored
       if (isConnected &&
           (hasErrorNotifier.value || isOfflineModeNotifier.value)) {
-        isOfflineModeNotifier.value = false;
-        hasErrorNotifier.value = false;
-        retryLoading();
+        _syncWithCloud();
       }
     });
+  }
+
+  /// Smartly synchronizes with Mother's Hut live cloud when internet is detected
+  Future<void> _syncWithCloud() async {
+    if (!mounted) return;
+    debugPrint("Mother's Hut: Smart cloud sync triggered...");
+    _wasOffline = true;
+    isOfflineModeNotifier.value = false;
+    hasErrorNotifier.value = false;
+    isLoadingNotifier.value = true;
+    progressNotifier.value = 0;
+
+    ScaffoldMessenger.of(context).clearSnackBars();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Row(
+          children: [
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Colors.white,
+              ),
+            ),
+            SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                'Connecting to Mother\'s Hut cloud...',
+                style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: const Color(0xFF8B4513),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+        ),
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+      ),
+    );
+
+    await controller.loadRequest(Uri.parse(websiteUrl));
   }
 
   @override
@@ -1044,10 +1151,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
                 fit: StackFit.expand,
                 children: [
                   // 1. Primary WebView with Hybrid Composition - renders live site or saved offline home page
-                  Offstage(
-                    offstage: hasError,
-                    child: _buildWebView(),
-                  ),
+                  if (!hasError)
+                    _buildWebView(),
 
                   // 2. Full-Screen Skeleton Loader shown ONLY on Initial Cold Start
                   ValueListenableBuilder<bool>(
