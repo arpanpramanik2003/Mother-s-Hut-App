@@ -51,6 +51,10 @@ class WebViewScreen extends StatefulWidget {
 class _WebViewScreenState extends State<WebViewScreen> {
   late final WebViewController controller;
 
+  // Native Android MethodChannel for permissions and system settings
+  static const MethodChannel _nativeChannel =
+      MethodChannel('com.motherhut.mothers_hut_app/permissions');
+
   // Static constants for high-speed, zero-allocation intent routing
   static const Set<String> _deviceSchemes = {'tel', 'mailto', 'sms', 'geo'};
   static const Set<String> _upiSchemes = {
@@ -79,6 +83,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
   final ValueNotifier<bool> isLoadingNotifier = ValueNotifier<bool>(true);
   final ValueNotifier<bool> isInitialLoadNotifier = ValueNotifier<bool>(true);
   final ValueNotifier<bool> hasErrorNotifier = ValueNotifier<bool>(false);
+  final ValueNotifier<bool> isRetryingNotifier = ValueNotifier<bool>(false);
 
   DateTime? _lastBackPressed;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
@@ -90,7 +95,58 @@ class _WebViewScreenState extends State<WebViewScreen> {
   void initState() {
     super.initState();
     initializeWebView();
+    _checkInitialConnectivityAndLoad();
     _initConnectivityListener();
+    _requestInitialLocationPermission();
+  }
+
+  /// Request runtime location permission on initial app launch for the delivery auto-locate feature
+  Future<void> _requestInitialLocationPermission() async {
+    await Future.delayed(const Duration(milliseconds: 600));
+    if (mounted) {
+      await _requestLocationPermission();
+    }
+  }
+
+  /// Native location permission requester via Kotlin MethodChannel
+  Future<bool> _requestLocationPermission() async {
+    try {
+      final bool? granted = await _nativeChannel.invokeMethod<bool>(
+        'requestLocationPermission',
+      );
+      return granted ?? false;
+    } catch (e) {
+      debugPrint('Error requesting location permission: $e');
+      return false;
+    }
+  }
+
+  /// Open Android Wi-Fi / Wireless Settings directly so user can enable internet with 1 tap
+  Future<void> _openWirelessSettings() async {
+    try {
+      await _nativeChannel.invokeMethod('openWirelessSettings');
+    } catch (e) {
+      debugPrint('Error opening wireless settings: $e');
+    }
+  }
+
+  /// Proactively inspect network connectivity on startup before loading
+  Future<void> _checkInitialConnectivityAndLoad() async {
+    try {
+      final results = await Connectivity().checkConnectivity();
+      final isConnected = results.any((r) => r != ConnectivityResult.none);
+      if (!isConnected) {
+        hasErrorNotifier.value = true;
+        isLoadingNotifier.value = false;
+        if (isInitialLoadNotifier.value) {
+          isInitialLoadNotifier.value = false;
+        }
+      } else {
+        controller.loadRequest(Uri.parse(websiteUrl));
+      }
+    } catch (e) {
+      controller.loadRequest(Uri.parse(websiteUrl));
+    }
   }
 
   void _initConnectivityListener() {
@@ -115,6 +171,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
     isLoadingNotifier.dispose();
     isInitialLoadNotifier.dispose();
     hasErrorNotifier.dispose();
+    isRetryingNotifier.dispose();
     super.dispose();
   }
 
@@ -122,6 +179,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
     controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setBackgroundColor(Colors.white)
+      ..addJavaScriptChannel(
+        'MothersHutLocationBridge',
+        onMessageReceived: (JavaScriptMessage message) {
+          if (message.message == 'requestLocation') {
+            _requestLocationPermission();
+          }
+        },
+      )
       ..setNavigationDelegate(
         NavigationDelegate(
           onProgress: (value) {
@@ -152,12 +217,26 @@ class _WebViewScreenState extends State<WebViewScreen> {
           },
 
           onWebResourceError: (error) {
-            debugPrint("Mother's Hut onWebResourceError: [${error.errorCode}] ${error.description} (isForMainFrame: ${error.isForMainFrame})");
-            // Only show the error screen when the main website frame fails.
-            if (error.isForMainFrame == false) return;
+            debugPrint(
+              "Mother's Hut onWebResourceError: [${error.errorCode}] ${error.description} (isForMainFrame: ${error.isForMainFrame})",
+            );
 
-            isLoadingNotifier.value = false;
-            hasErrorNotifier.value = true;
+            // Catch network disconnects, DNS resolution errors, host lookup, or main frame failures
+            final description = error.description.toLowerCase();
+            final isNetworkError =
+                error.errorCode == -2 || // ERROR_HOST_LOOKUP
+                error.errorCode == -6 || // ERROR_CONNECT
+                error.errorCode == -8 || // ERROR_TIMEOUT
+                error.errorCode == -1 || // ERROR_UNKNOWN
+                description.contains('net::err_internet_disconnected') ||
+                description.contains('net::err_name_not_resolved') ||
+                description.contains('net::err_connection_refused') ||
+                description.contains('net::err_address_unreachable');
+
+            if (error.isForMainFrame == true || isNetworkError) {
+              isLoadingNotifier.value = false;
+              hasErrorNotifier.value = true;
+            }
           },
 
           onNavigationRequest: _handleNavigationRequest,
@@ -165,8 +244,6 @@ class _WebViewScreenState extends State<WebViewScreen> {
       );
 
     _configurePlatformCapabilities();
-
-    controller.loadRequest(Uri.parse(websiteUrl));
   }
 
   void _configurePlatformCapabilities() {
@@ -214,6 +291,20 @@ class _WebViewScreenState extends State<WebViewScreen> {
           }
         `;
         document.head.appendChild(style);
+
+        // Intercept geolocation requests from web scripts / map auto-locate
+        if (navigator.geolocation && !window.__mhGeoHooked) {
+          window.__mhGeoHooked = true;
+          var origGeo = navigator.geolocation.getCurrentPosition.bind(navigator.geolocation);
+          navigator.geolocation.getCurrentPosition = function(success, error, options) {
+            try {
+              if (window.MothersHutLocationBridge) {
+                window.MothersHutLocationBridge.postMessage('requestLocation');
+              }
+            } catch(e) {}
+            origGeo(success, error, options);
+          };
+        }
 
         // Redirect window.open to location.href for Flutter intent interception
         window.open = function(url) {
@@ -281,7 +372,11 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
     // 5. Social media platforms (open in native apps if installed)
     if (_socialHosts.any((h) => host.contains(h))) {
-      _launchExternalUrl(uri, 'Social App', mode: LaunchMode.externalApplication);
+      _launchExternalUrl(
+        uri,
+        'Social App',
+        mode: LaunchMode.externalApplication,
+      );
       return NavigationDecision.prevent;
     }
 
@@ -339,11 +434,45 @@ class _WebViewScreenState extends State<WebViewScreen> {
   }
 
   Future<void> retryLoading() async {
-    hasErrorNotifier.value = false;
-    isLoadingNotifier.value = true;
-    progressNotifier.value = 0;
+    if (isRetryingNotifier.value) return;
+    isRetryingNotifier.value = true;
 
-    await controller.reload();
+    try {
+      final results = await Connectivity().checkConnectivity();
+      final isConnected = results.any((r) => r != ConnectivityResult.none);
+
+      if (!isConnected) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).clearSnackBars();
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text(
+                'Still offline. Please enable Wi-Fi or Mobile Data.',
+                style: TextStyle(color: Colors.white),
+              ),
+              backgroundColor: const Color(0xFF8B4513),
+              duration: const Duration(seconds: 2),
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+              margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+            ),
+          );
+        }
+        return;
+      }
+
+      hasErrorNotifier.value = false;
+      isLoadingNotifier.value = true;
+      progressNotifier.value = 0;
+
+      await controller.loadRequest(Uri.parse(websiteUrl));
+    } finally {
+      if (mounted) {
+        isRetryingNotifier.value = false;
+      }
+    }
   }
 
   Future<void> handleBack() async {
@@ -401,6 +530,173 @@ class _WebViewScreenState extends State<WebViewScreen> {
     return WebViewWidget(controller: controller);
   }
 
+  Widget _buildOfflineInterface() {
+    return Container(
+      color: Colors.white,
+      width: double.infinity,
+      height: double.infinity,
+      child: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Branded Logo with soft container
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF8B4513).withValues(alpha: 0.06),
+                  shape: BoxShape.circle,
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(20),
+                  child: Image.asset(
+                    'assets/images/mothers_hut_logo.png',
+                    width: 84,
+                    height: 84,
+                    fit: BoxFit.contain,
+                    errorBuilder: (context, error, stackTrace) => Container(
+                      width: 84,
+                      height: 84,
+                      decoration: const BoxDecoration(
+                        color: Color(0xFF8B4513),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(
+                        Icons.restaurant_rounded,
+                        size: 44,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 24),
+
+              // Title
+              const Text(
+                'No Internet Connection',
+                style: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF222222),
+                  letterSpacing: -0.3,
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              // Subtitle
+              const Text(
+                'Please turn on Wi-Fi or Mobile Data to view dishes, place orders, and track your food deliveries.\nMother\'s Hut will auto-connect once you\'re back online.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Colors.black54,
+                  height: 1.45,
+                ),
+              ),
+
+              const SizedBox(height: 32),
+
+              // Primary Action: Turn on Internet (opens Wireless settings)
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: _openWirelessSettings,
+                  icon: const Icon(Icons.settings_outlined, size: 20),
+                  label: const Text(
+                    'Turn On Internet',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF8B4513),
+                    foregroundColor: Colors.white,
+                    elevation: 1,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              // Secondary Action: Retry Connection
+              ValueListenableBuilder<bool>(
+                valueListenable: isRetryingNotifier,
+                builder: (context, isRetrying, _) {
+                  return SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: isRetrying ? null : retryLoading,
+                      icon: isRetrying
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Color(0xFF8B4513),
+                              ),
+                            )
+                          : const Icon(Icons.refresh_rounded, size: 20),
+                      label: Text(
+                        isRetrying ? 'Checking connection...' : 'Try Again',
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFF8B4513),
+                        side: const BorderSide(
+                          color: Color(0xFF8B4513),
+                          width: 1.5,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                    ),
+                  );
+                },
+              ),
+
+              const SizedBox(height: 28),
+
+              // Auto-reconnect banner
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: const BoxDecoration(
+                      color: Color(0xFF4CAF50),
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'Auto-reconnect active when online',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.black45,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return PopScope(
@@ -413,164 +709,37 @@ class _WebViewScreenState extends State<WebViewScreen> {
       child: Scaffold(
         backgroundColor: Colors.white,
         body: SafeArea(
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              // 1. Primary WebView with Hybrid Composition for silky smooth 60/120Hz native touch and scrolling
-              _buildWebView(),
+          child: ValueListenableBuilder<bool>(
+            valueListenable: hasErrorNotifier,
+            builder: (context, hasError, _) {
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  // 1. Primary WebView with Hybrid Composition - completely hidden when offline so Chromium's raw error never appears
+                  Offstage(
+                    offstage: hasError,
+                    child: _buildWebView(),
+                  ),
 
-              // 2. Full-Screen Skeleton Loader shown ONLY on Initial Cold Start (completely unmounted once loaded to eliminate background ticking)
-              Positioned.fill(
-                child: ValueListenableBuilder<bool>(
-                  valueListenable: hasErrorNotifier,
-                  builder: (context, hasError, _) {
-                    if (hasError) return const SizedBox.shrink();
-                    return ValueListenableBuilder<bool>(
-                      valueListenable: isInitialLoadNotifier,
-                      builder: (context, isInitialLoad, _) {
-                        if (!isInitialLoad) return const SizedBox.shrink();
-                        return const SkeletonLoader();
-                      },
-                    );
-                  },
-                ),
-              ),
+                  // 2. Full-Screen Skeleton Loader shown ONLY on Initial Cold Start
+                  ValueListenableBuilder<bool>(
+                    valueListenable: isInitialLoadNotifier,
+                    builder: (context, isInitialLoad, _) {
+                      if (!isInitialLoad || hasError) {
+                        return const SizedBox.shrink();
+                      }
+                      return const SkeletonLoader();
+                    },
+                  ),
 
-              // 3. Sleek, Branded Top Progress Bar for In-Page Route Navigations
-              Positioned(
-                top: 0,
-                left: 0,
-                right: 0,
-                child: ValueListenableBuilder<bool>(
-                  valueListenable: hasErrorNotifier,
-                  builder: (context, hasError, _) {
-                    if (hasError) return const SizedBox.shrink();
-                    return ValueListenableBuilder<bool>(
-                      valueListenable: isInitialLoadNotifier,
-                      builder: (context, isInitialLoad, _) {
-                        if (isInitialLoad) return const SizedBox.shrink();
-                        return ValueListenableBuilder<bool>(
-                          valueListenable: isLoadingNotifier,
-                          builder: (context, isLoading, _) {
-                            return ValueListenableBuilder<int>(
-                              valueListenable: progressNotifier,
-                              builder: (context, progress, _) {
-                                final isVisible =
-                                    isLoading && progress > 0 && progress < 100;
-                                if (!isVisible) return const SizedBox.shrink();
-                                return LinearProgressIndicator(
-                                  value: progress / 100.0,
-                                  backgroundColor: Colors.transparent,
-                                  valueColor:
-                                      const AlwaysStoppedAnimation<Color>(
-                                        Color(0xFF8B4513),
-                                      ),
-                                  minHeight: 2.5,
-                                );
-                              },
-                            );
-                          },
-                        );
-                      },
-                    );
-                  },
-                ),
-              ),
-
-              // 4. Enhanced Branded Offline / Error Screen
-              Positioned.fill(
-                child: ValueListenableBuilder<bool>(
-                  valueListenable: hasErrorNotifier,
-                  builder: (context, hasError, _) {
-                    if (!hasError) return const SizedBox.shrink();
-                    return Container(
-                      color: Colors.white,
-                      width: double.infinity,
-                      height: double.infinity,
-                      child: Center(
-                        child: SingleChildScrollView(
-                          padding: const EdgeInsets.all(28),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(18),
-                                child: Image.asset(
-                                  'assets/images/mothers_hut_logo.png',
-                                  width: 90,
-                                  height: 90,
-                                  fit: BoxFit.contain,
-                                  errorBuilder: (context, error, stackTrace) =>
-                                      Container(
-                                        width: 90,
-                                        height: 90,
-                                        decoration: BoxDecoration(
-                                          color: const Color(
-                                            0xFF8B4513,
-                                          ).withValues(alpha: 0.1),
-                                          shape: BoxShape.circle,
-                                        ),
-                                        child: const Icon(
-                                          Icons.wifi_off_rounded,
-                                          size: 48,
-                                          color: Color(0xFF8B4513),
-                                        ),
-                                      ),
-                                ),
-                              ),
-
-                              const SizedBox(height: 24),
-
-                              const Text(
-                                'Connection Problem',
-                                style: TextStyle(
-                                  fontSize: 22,
-                                  fontWeight: FontWeight.bold,
-                                  color: Color(0xFF222222),
-                                ),
-                              ),
-
-                              const SizedBox(height: 10),
-
-                              const Text(
-                                'Unable to connect to Mother\'s Hut.\n'
-                                'Please check your internet connection. The app will auto-reconnect once back online.',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  color: Colors.black54,
-                                  height: 1.4,
-                                ),
-                              ),
-
-                              const SizedBox(height: 28),
-
-                              ElevatedButton.icon(
-                                onPressed: retryLoading,
-                                icon: const Icon(Icons.refresh_rounded),
-                                label: const Text('Try Again'),
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: const Color(0xFF8B4513),
-                                  foregroundColor: Colors.white,
-                                  elevation: 2,
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 32,
-                                    vertical: 14,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
-            ],
+                  // 3. Smart, Branded Offline Interface
+                  if (hasError)
+                    Positioned.fill(
+                      child: _buildOfflineInterface(),
+                    ),
+                ],
+              );
+            },
           ),
         ),
       ),
