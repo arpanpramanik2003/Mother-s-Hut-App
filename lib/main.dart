@@ -105,14 +105,27 @@ class _WebViewScreenState extends State<WebViewScreen> {
     initializeWebView();
     _checkInitialConnectivityAndLoad();
     _initConnectivityListener();
-    _requestInitialLocationPermission();
+    _requestInitialAppPermissions();
   }
 
-  /// Request runtime location permission on initial app launch for the delivery auto-locate feature
-  Future<void> _requestInitialLocationPermission() async {
+  /// Request all runtime permissions (Location, Camera, Microphone, Storage/Media, Notifications) on cold start
+  Future<void> _requestInitialAppPermissions() async {
     await Future.delayed(const Duration(milliseconds: 600));
     if (mounted) {
-      await _requestLocationPermission();
+      await _requestAllPermissions();
+    }
+  }
+
+  /// Native bulk permission requester via Kotlin MethodChannel
+  Future<bool> _requestAllPermissions() async {
+    try {
+      final bool? granted = await _nativeChannel.invokeMethod<bool>(
+        'requestAllAppPermissions',
+      );
+      return granted ?? false;
+    } catch (e) {
+      debugPrint('Error requesting all permissions: $e');
+      return false;
     }
   }
 
@@ -282,6 +295,11 @@ class _WebViewScreenState extends State<WebViewScreen> {
           allow: true,
           retain: true,
         ),
+      );
+
+      // Auto-grant protected web resource permissions (camera, microphone)
+      androidController.setOnPlatformPermissionRequest(
+        (request) => request.grant(),
       );
 
       // Media playback without requiring physical gesture

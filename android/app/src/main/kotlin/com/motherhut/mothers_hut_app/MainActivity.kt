@@ -13,6 +13,7 @@ import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.motherhut.mothers_hut_app/permissions"
+    private val ALL_PERMISSIONS_REQUEST_CODE = 1000
     private val LOCATION_PERMISSION_REQUEST_CODE = 1001
     private var pendingResult: MethodChannel.Result? = null
 
@@ -21,6 +22,19 @@ class MainActivity : FlutterActivity() {
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
+                "requestAllAppPermissions" -> {
+                    val ungranted = getUngrantedPermissions()
+                    if (ungranted.isEmpty()) {
+                        result.success(true)
+                    } else {
+                        pendingResult = result
+                        ActivityCompat.requestPermissions(
+                            this,
+                            ungranted,
+                            ALL_PERMISSIONS_REQUEST_CODE
+                        )
+                    }
+                }
                 "requestLocationPermission" -> {
                     if (isLocationPermissionGranted()) {
                         result.success(true)
@@ -67,6 +81,37 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun getRequiredPermissions(): Array<String> {
+        val permissions = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
+        )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Android 13+ (API 33+)
+            permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
+            permissions.add(Manifest.permission.READ_MEDIA_VIDEO)
+            permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            // Android 12 and below
+            permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q) {
+                permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            }
+        }
+
+        return permissions.toTypedArray()
+    }
+
+    private fun getUngrantedPermissions(): Array<String> {
+        return getRequiredPermissions().filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }.toTypedArray()
+    }
+
     private fun isLocationPermissionGranted(): Boolean {
         val fineLocation = ContextCompat.checkSelfPermission(
             this,
@@ -87,10 +132,17 @@ class MainActivity : FlutterActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == LOCATION_PERMISSION_REQUEST_CODE) {
-            val granted = grantResults.isNotEmpty() && grantResults.any { it == PackageManager.PERMISSION_GRANTED }
-            pendingResult?.success(granted)
-            pendingResult = null
+        when (requestCode) {
+            ALL_PERMISSIONS_REQUEST_CODE -> {
+                val allGranted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+                pendingResult?.success(allGranted)
+                pendingResult = null
+            }
+            LOCATION_PERMISSION_REQUEST_CODE -> {
+                val granted = grantResults.isNotEmpty() && grantResults.any { it == PackageManager.PERMISSION_GRANTED }
+                pendingResult?.success(granted)
+                pendingResult = null
+            }
         }
     }
 }
