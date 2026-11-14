@@ -168,7 +168,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
     }
   }
 
-  /// Captures the rendered DOM of the home page, strips floating popups/ads, and persists it to local phone storage
+  /// Captures the rendered DOM of the home page, strips scripts/ads/popups, and persists it to local phone storage
   Future<void> _saveHomePageSnapshot() async {
     try {
       // Delay slightly so dynamic React/Vue/carousels finish mounting
@@ -180,7 +180,13 @@ class _WebViewScreenState extends State<WebViewScreen> {
         (function() {
           var clone = document.documentElement.cloneNode(true);
           
-          // Remove floating advertisement cards, promo banners, modals, popups, and overlays
+          // 1. Remove all executable <script> tags to prevent React/JS hydration crashes and DOM wipes offline
+          var scripts = clone.querySelectorAll('script');
+          for (var s = 0; s < scripts.length; s++) {
+            scripts[s].remove();
+          }
+
+          // 2. Remove floating advertisement cards, promo banners, modals, popups, and overlays
           var adSelectors = [
             '[class*="modal"]',
             '[class*="popup"]',
@@ -216,7 +222,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
             } catch(e) {}
           });
 
-          // Also remove any fixed floating banner divs with high z-index
+          // 3. Remove fixed floating overlays with high z-index
           try {
             var allDivs = clone.querySelectorAll('div, section, aside');
             for (var j = 0; j < allDivs.length; j++) {
@@ -253,7 +259,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
         if (file != null) {
           await file.writeAsString(html, flush: true);
           debugPrint(
-            "Mother's Hut: Clean home page snapshot saved locally (${html.length} bytes, popups/ads removed)",
+            "Mother's Hut: Clean home page snapshot saved locally (${html.length} bytes, scripts/popups removed)",
           );
         }
       }
@@ -264,11 +270,20 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
   /// Loads the saved local home page with an injected offline bar and action guard
   Future<bool> _tryLoadOfflineHomePage() async {
+    // CRITICAL GUARD: If already in offline mode, do NOT re-execute or reload!
+    if (isOfflineModeNotifier.value) return true;
+
     try {
       final file = await _getCachedHomeFile();
       if (file != null && await file.exists()) {
         String html = await file.readAsString();
         if (html.length > 500) {
+          // Double-check: ensure any remaining <script> tags are purged to prevent React/JS DOM wipe
+          html = html.replaceAll(
+            RegExp(r'<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>', caseSensitive: false),
+            '',
+          );
+
           // Inject sticky offline indicator bar and action lock script
           const offlineBannerAndScript = '''
             <div id="mh-offline-bar" style="position:fixed; top:0; left:0; right:0; z-index:2147483647; background:linear-gradient(90deg, #8B4513 0%, #A0522D 100%); color:#ffffff; padding:10px 14px; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size:13px; font-weight:600; display:flex; align-items:center; justify-content:space-between; box-shadow:0 3px 10px rgba(0,0,0,0.25);">
@@ -325,7 +340,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
           await controller.loadHtmlString(html, baseUrl: websiteUrl);
           debugPrint(
-            "Mother's Hut: Rendered saved local home page in offline mode!",
+            "Mother's Hut: Rendered clean saved local home page in offline mode!",
           );
           return true;
         }
@@ -495,25 +510,19 @@ class _WebViewScreenState extends State<WebViewScreen> {
               "Mother's Hut onWebResourceError: [${error.errorCode}] ${error.description} (isForMainFrame: ${error.isForMainFrame})",
             );
 
-            // Catch network disconnects, DNS resolution errors, host lookup, or main frame failures
-            final description = error.description.toLowerCase();
-            final isNetworkError =
-                error.errorCode == -2 || // ERROR_HOST_LOOKUP
-                error.errorCode == -6 || // ERROR_CONNECT
-                error.errorCode == -8 || // ERROR_TIMEOUT
-                error.errorCode == -1 || // ERROR_UNKNOWN
-                description.contains('net::err_internet_disconnected') ||
-                description.contains('net::err_name_not_resolved') ||
-                description.contains('net::err_connection_refused') ||
-                description.contains('net::err_address_unreachable');
+            // GUARD 1: If already in offline mode, completely ignore all subresource network errors!
+            // This eliminates the infinite reload/flickering loop.
+            if (isOfflineModeNotifier.value) return;
 
-            if (error.isForMainFrame == true || isNetworkError) {
-              // Attempt to load the saved home page instead of showing raw error
-              final loaded = await _tryLoadOfflineHomePage();
-              if (!loaded) {
-                isLoadingNotifier.value = false;
-                hasErrorNotifier.value = true;
-              }
+            // GUARD 2: ONLY react if the failure is on the main navigation frame!
+            // Subresources (images, analytics, fonts) must NEVER trigger a full page reload!
+            if (error.isForMainFrame != true) return;
+
+            // Main frame navigation failed (device is offline)
+            final loaded = await _tryLoadOfflineHomePage();
+            if (!loaded) {
+              isLoadingNotifier.value = false;
+              hasErrorNotifier.value = true;
             }
           },
 
