@@ -178,6 +178,11 @@ class _WebViewScreenState extends State<WebViewScreen> {
         AndroidWebViewController.enableDebugging(true);
       }
 
+      // Smooth scrolling optimizations: Disable native scrollbars and allow mixed assets
+      androidController.setVerticalScrollBarEnabled(false);
+      androidController.setHorizontalScrollBarEnabled(false);
+      androidController.setMixedContentMode(MixedContentMode.alwaysAllow);
+
       // Geolocation permissions callback: Auto-allow for Mother's Hut portal
       androidController.setGeolocationPermissionsPromptCallbacks(
         onShowPrompt: (request) async => const GeolocationPermissionsResponse(
@@ -196,6 +201,19 @@ class _WebViewScreenState extends State<WebViewScreen> {
       (function() {
         if (window.__mhBridgeInjected) return;
         window.__mhBridgeInjected = true;
+
+        // Force native GPU-accelerated touch momentum scrolling and disable rubber-banding conflicts
+        var style = document.createElement('style');
+        style.innerHTML = `
+          * {
+            -webkit-tap-highlight-color: transparent !important;
+          }
+          html, body {
+            -webkit-overflow-scrolling: touch !important;
+            overscroll-behavior-y: none !important;
+          }
+        `;
+        document.head.appendChild(style);
 
         // Redirect window.open to location.href for Flutter intent interception
         window.open = function(url) {
@@ -371,6 +389,18 @@ class _WebViewScreenState extends State<WebViewScreen> {
     }
   }
 
+  Widget _buildWebView() {
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      return WebViewWidget.fromPlatformCreationParams(
+        params: AndroidWebViewWidgetCreationParams(
+          controller: controller.platform,
+          displayWithHybridComposition: true,
+        ),
+      );
+    }
+    return WebViewWidget(controller: controller);
+  }
+
   @override
   Widget build(BuildContext context) {
     return PopScope(
@@ -386,12 +416,10 @@ class _WebViewScreenState extends State<WebViewScreen> {
           child: Stack(
             fit: StackFit.expand,
             children: [
-              // 1. Primary WebView - Full, tight, non-empty bounds (fixes '!size.isEmpty' assertion)
-              WebViewWidget(
-                controller: controller,
-              ),
+              // 1. Primary WebView with Hybrid Composition for silky smooth 60/120Hz native touch and scrolling
+              _buildWebView(),
 
-              // 2. Full-Screen Skeleton Loader shown ONLY on Initial Cold Start
+              // 2. Full-Screen Skeleton Loader shown ONLY on Initial Cold Start (completely unmounted once loaded to eliminate background ticking)
               Positioned.fill(
                 child: ValueListenableBuilder<bool>(
                   valueListenable: hasErrorNotifier,
@@ -400,15 +428,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
                     return ValueListenableBuilder<bool>(
                       valueListenable: isInitialLoadNotifier,
                       builder: (context, isInitialLoad, _) {
-                        return IgnorePointer(
-                          ignoring: !isInitialLoad,
-                          child: AnimatedOpacity(
-                            opacity: isInitialLoad ? 1.0 : 0.0,
-                            duration: const Duration(milliseconds: 350),
-                            curve: Curves.easeOut,
-                            child: const SkeletonLoader(),
-                          ),
-                        );
+                        if (!isInitialLoad) return const SizedBox.shrink();
+                        return const SkeletonLoader();
                       },
                     );
                   },
@@ -436,20 +457,15 @@ class _WebViewScreenState extends State<WebViewScreen> {
                               builder: (context, progress, _) {
                                 final isVisible =
                                     isLoading && progress > 0 && progress < 100;
-                                return AnimatedOpacity(
-                                  opacity: isVisible ? 1.0 : 0.0,
-                                  duration: const Duration(milliseconds: 180),
-                                  child: isVisible
-                                      ? LinearProgressIndicator(
-                                          value: progress / 100.0,
-                                          backgroundColor: Colors.transparent,
-                                          valueColor:
-                                              const AlwaysStoppedAnimation<Color>(
-                                                Color(0xFF8B4513),
-                                              ),
-                                          minHeight: 2.5,
-                                        )
-                                      : const SizedBox(height: 2.5),
+                                if (!isVisible) return const SizedBox.shrink();
+                                return LinearProgressIndicator(
+                                  value: progress / 100.0,
+                                  backgroundColor: Colors.transparent,
+                                  valueColor:
+                                      const AlwaysStoppedAnimation<Color>(
+                                        Color(0xFF8B4513),
+                                      ),
+                                  minHeight: 2.5,
                                 );
                               },
                             );
