@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'widgets/skeleton_loader.dart';
 
 void main() {
@@ -49,6 +50,30 @@ class WebViewScreen extends StatefulWidget {
 
 class _WebViewScreenState extends State<WebViewScreen> {
   late final WebViewController controller;
+
+  // Static constants for high-speed, zero-allocation intent routing
+  static const Set<String> _deviceSchemes = {'tel', 'mailto', 'sms', 'geo'};
+  static const Set<String> _upiSchemes = {
+    'upi',
+    'paytmmp',
+    'phonepe',
+    'tez',
+    'gpay',
+  };
+  static const List<String> _chatHosts = ['wa.me', 'whatsapp.com'];
+  static const List<String> _mapHosts = [
+    'maps.google.',
+    'goo.gl',
+    'maps.app.goo.gl',
+  ];
+  static const List<String> _socialHosts = [
+    'instagram.com',
+    'facebook.com',
+    'youtube.com',
+    'youtu.be',
+    'twitter.com',
+    'x.com',
+  ];
 
   final ValueNotifier<int> progressNotifier = ValueNotifier<int>(0);
   final ValueNotifier<bool> isLoadingNotifier = ValueNotifier<bool>(true);
@@ -119,6 +144,9 @@ class _WebViewScreenState extends State<WebViewScreen> {
             if (isInitialLoadNotifier.value) {
               isInitialLoadNotifier.value = false;
             }
+
+            // Bridge target="_blank" and window.open for reliable redirects and payment handling
+            _injectWindowBridge();
           },
 
           onWebResourceError: (error) {
@@ -131,8 +159,81 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
           onNavigationRequest: _handleNavigationRequest,
         ),
-      )
-      ..loadRequest(Uri.parse(websiteUrl));
+      );
+
+    _configurePlatformCapabilities();
+
+    controller.loadRequest(Uri.parse(websiteUrl));
+  }
+
+  void _configurePlatformCapabilities() async {
+    if (controller.platform is AndroidWebViewController) {
+      final androidController = controller.platform as AndroidWebViewController;
+
+      // Enable WebContents debugging in debug mode
+      if (kDebugMode) {
+        AndroidWebViewController.enableDebugging(true);
+      }
+
+      // Geolocation permissions callback: Auto-allow for Mother's Hut portal
+      androidController.setGeolocationPermissionsPromptCallbacks(
+        onShowPrompt: (request) async => const GeolocationPermissionsResponse(
+          allow: true,
+          retain: true,
+        ),
+      );
+
+      // Auto-grant protected web resource permissions (camera, microphone)
+      androidController.setOnPlatformPermissionRequest(
+        (request) => request.grant(),
+      );
+
+      // Media playback without requiring physical gesture
+      androidController.setMediaPlaybackRequiresUserGesture(false);
+
+      // Clean User-Agent: Strip '; wv' to prevent Google Auth / Cloudflare blocks
+      try {
+        final currentUa = await controller.getUserAgent();
+        if (currentUa != null && currentUa.contains('; wv')) {
+          final cleanUa = currentUa.replaceAll('; wv', '');
+          await controller.setUserAgent(cleanUa);
+        }
+      } catch (e) {
+        debugPrint('Could not sanitize User-Agent: $e');
+      }
+    }
+  }
+
+  void _injectWindowBridge() {
+    controller.runJavaScript('''
+      (function() {
+        // Redirect window.open to location.href for Flutter intent interception
+        window.open = function(url) {
+          if (url) {
+            window.location.href = url;
+          }
+          return window;
+        };
+
+        // Convert target="_blank" anchors to target="_self"
+        function fixBlankTargets() {
+          var links = document.getElementsByTagName('a');
+          for (var i = 0; i < links.length; i++) {
+            if (links[i].getAttribute('target') === '_blank') {
+              links[i].setAttribute('target', '_self');
+            }
+          }
+        }
+        fixBlankTargets();
+
+        // Observe DOM for dynamically rendered links (React, Vue, SPA, modals)
+        if (window.MutationObserver) {
+          new MutationObserver(fixBlankTargets).observe(document.body, { childList: true, subtree: true });
+        }
+      })();
+    ''').catchError((e) {
+      debugPrint('Error injecting window bridge: $e');
+    });
   }
 
   Future<NavigationDecision> _handleNavigationRequest(
@@ -144,88 +245,92 @@ class _WebViewScreenState extends State<WebViewScreen> {
     final scheme = uri.scheme.toLowerCase();
     final host = uri.host.toLowerCase();
 
+    // 0. FAST PATH: Instant internal portal dispatch (0ms delay)
+    if (host == 'mothershut.com' || host.endsWith('.mothershut.com')) {
+      return NavigationDecision.navigate;
+    }
+
     // 1. Direct device schemes: Phone call, Email, SMS, Geolocation
-    if (scheme == 'tel' ||
-        scheme == 'mailto' ||
-        scheme == 'sms' ||
-        scheme == 'geo') {
-      try {
-        if (await canLaunchUrl(uri)) {
-          await launchUrl(uri);
-        }
-      } catch (e) {
-        debugPrint('Could not launch scheme $scheme: $e');
-      }
+    if (_deviceSchemes.contains(scheme)) {
+      _launchExternalUrl(uri, 'Device Tool');
       return NavigationDecision.prevent;
     }
 
-    // 2. UPI & Payment applications
-    if (scheme == 'upi' ||
-        scheme == 'paytmmp' ||
-        scheme == 'phonepe' ||
-        scheme == 'tez' ||
-        scheme == 'gpay') {
-      try {
-        if (await canLaunchUrl(uri)) {
-          await launchUrl(uri, mode: LaunchMode.externalApplication);
-          return NavigationDecision.prevent;
-        }
-      } catch (e) {
-        debugPrint('Could not launch payment app: $e');
-      }
+    // 2. UPI & Payment applications with graceful fallback
+    if (_upiSchemes.contains(scheme)) {
+      _launchUpiPayment(uri);
       return NavigationDecision.prevent;
     }
 
     // 3. WhatsApp (Direct app or wa.me links)
-    if (scheme == 'whatsapp' ||
-        host.contains('wa.me') ||
-        host.contains('whatsapp.com')) {
-      try {
-        if (await canLaunchUrl(uri)) {
-          await launchUrl(uri, mode: LaunchMode.externalApplication);
-          return NavigationDecision.prevent;
-        }
-      } catch (e) {
-        debugPrint('Could not launch WhatsApp: $e');
-      }
+    if (scheme == 'whatsapp' || _chatHosts.any((h) => host.contains(h))) {
+      _launchExternalUrl(uri, 'WhatsApp', mode: LaunchMode.externalApplication);
       return NavigationDecision.prevent;
     }
 
     // 4. Google Maps & Navigation
-    if (host.contains('maps.google.') ||
-        host.contains('goo.gl') ||
-        host.contains('maps.app.goo.gl')) {
-      try {
-        if (await canLaunchUrl(uri)) {
-          await launchUrl(uri, mode: LaunchMode.externalApplication);
-          return NavigationDecision.prevent;
-        }
-      } catch (e) {
-        debugPrint('Could not launch Maps: $e');
-      }
+    if (_mapHosts.any((h) => host.contains(h))) {
+      _launchExternalUrl(uri, 'Maps', mode: LaunchMode.externalApplication);
       return NavigationDecision.prevent;
     }
 
     // 5. Social media platforms (open in native apps if installed)
-    if (host.contains('instagram.com') ||
-        host.contains('facebook.com') ||
-        host.contains('youtube.com') ||
-        host.contains('youtu.be') ||
-        host.contains('twitter.com') ||
-        host.contains('x.com')) {
-      try {
-        if (await canLaunchUrl(uri)) {
-          await launchUrl(uri, mode: LaunchMode.externalApplication);
-          return NavigationDecision.prevent;
-        }
-      } catch (e) {
-        debugPrint('Could not launch social app: $e');
-      }
+    if (_socialHosts.any((h) => host.contains(h))) {
+      _launchExternalUrl(uri, 'Social App', mode: LaunchMode.externalApplication);
       return NavigationDecision.prevent;
     }
 
-    // Default: allow navigation inside WebView (mothershut.com, payment gateways, etc.)
+    // Default: allow navigation inside WebView (payment gateways, 3D Secure, OTPs)
     return NavigationDecision.navigate;
+  }
+
+  Future<void> _launchUpiPayment(Uri uri) async {
+    try {
+      final launched = await launchUrl(
+        uri,
+        mode: LaunchMode.externalApplication,
+      );
+      if (!launched) {
+        _showUpiFallbackNotice();
+      }
+    } catch (e) {
+      debugPrint('Could not launch UPI app: $e');
+      _showUpiFallbackNotice();
+    }
+  }
+
+  void _showUpiFallbackNotice() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).clearSnackBars();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text(
+          'No UPI application (GPay, PhonePe, Paytm) found on device. Please select Card or NetBanking.',
+          style: TextStyle(color: Colors.white),
+        ),
+        backgroundColor: const Color(0xFF8B4513),
+        duration: const Duration(seconds: 4),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+        ),
+        margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      ),
+    );
+  }
+
+  Future<void> _launchExternalUrl(
+    Uri uri,
+    String label, {
+    LaunchMode mode = LaunchMode.platformDefault,
+  }) async {
+    try {
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: mode);
+      }
+    } catch (e) {
+      debugPrint('Could not launch $label: $e');
+    }
   }
 
   Future<void> retryLoading() async {
@@ -238,34 +343,44 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
   Future<void> handleBack() async {
     if (await controller.canGoBack()) {
+      final currentUrl = await controller.currentUrl();
+      // If user navigated back to root portal, break redirect loops and trigger double-tap to exit
+      if (currentUrl != null &&
+          (currentUrl == websiteUrl || currentUrl == '$websiteUrl/')) {
+        _handleExitApp();
+        return;
+      }
       await controller.goBack();
     } else {
-      // Double tap to exit
-      final now = DateTime.now();
-      if (_lastBackPressed == null ||
-          now.difference(_lastBackPressed!) > const Duration(seconds: 2)) {
-        _lastBackPressed = now;
-        if (mounted) {
-          ScaffoldMessenger.of(context).clearSnackBars();
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Text(
-                'Press back again to exit',
-                style: TextStyle(color: Colors.white),
-              ),
-              backgroundColor: const Color(0xFF8B4513),
-              duration: const Duration(seconds: 2),
-              behavior: SnackBarBehavior.floating,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(10),
-              ),
-              margin: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+      _handleExitApp();
+    }
+  }
+
+  void _handleExitApp() {
+    final now = DateTime.now();
+    if (_lastBackPressed == null ||
+        now.difference(_lastBackPressed!) > const Duration(seconds: 2)) {
+      _lastBackPressed = now;
+      if (mounted) {
+        ScaffoldMessenger.of(context).clearSnackBars();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+              'Press back again to exit',
+              style: TextStyle(color: Colors.white),
             ),
-          );
-        }
-      } else {
-        SystemNavigator.pop();
+            backgroundColor: const Color(0xFF8B4513),
+            duration: const Duration(seconds: 2),
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+            ),
+            margin: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+          ),
+        );
       }
+    } else {
+      SystemNavigator.pop();
     }
   }
 
