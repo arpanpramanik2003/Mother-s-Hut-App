@@ -74,6 +74,9 @@ class MainActivity : FlutterActivity() {
                         result.error("SETTINGS_ERROR", e.message, null)
                     }
                 }
+                "getAppStoragePath" -> {
+                    result.success(applicationContext.filesDir.absolutePath)
+                }
                 else -> {
                     result.notImplemented()
                 }

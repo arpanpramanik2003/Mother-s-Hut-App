@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -51,7 +53,7 @@ class WebViewScreen extends StatefulWidget {
 class _WebViewScreenState extends State<WebViewScreen> {
   late final WebViewController controller;
 
-  // Native Android MethodChannel for permissions and system settings
+  // Native Android MethodChannel for permissions and system storage/settings
   static const MethodChannel _nativeChannel =
       MethodChannel('com.motherhut.mothers_hut_app/permissions');
 
@@ -92,6 +94,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
   final ValueNotifier<bool> isInitialLoadNotifier = ValueNotifier<bool>(true);
   final ValueNotifier<bool> hasErrorNotifier = ValueNotifier<bool>(false);
   final ValueNotifier<bool> isRetryingNotifier = ValueNotifier<bool>(false);
+  final ValueNotifier<bool> isOfflineModeNotifier = ValueNotifier<bool>(false);
 
   DateTime? _lastBackPressed;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
@@ -151,18 +154,240 @@ class _WebViewScreenState extends State<WebViewScreen> {
     }
   }
 
+  /// Retrieve local file path for storing the cached home page HTML
+  Future<File?> _getCachedHomeFile() async {
+    try {
+      final String? appDir = await _nativeChannel.invokeMethod<String>(
+        'getAppStoragePath',
+      );
+      if (appDir == null) return null;
+      return File('$appDir/mothers_hut_home_cache.html');
+    } catch (e) {
+      debugPrint('Error resolving cache path: $e');
+      return null;
+    }
+  }
+
+  /// Captures the rendered DOM of the home page, strips floating popups/ads, and persists it to local phone storage
+  Future<void> _saveHomePageSnapshot() async {
+    try {
+      // Delay slightly so dynamic React/Vue/carousels finish mounting
+      await Future.delayed(const Duration(milliseconds: 1500));
+      if (!mounted) return;
+
+      final dynamic htmlResult = await controller.runJavaScriptReturningResult(
+        '''
+        (function() {
+          var clone = document.documentElement.cloneNode(true);
+          
+          // Remove floating advertisement cards, promo banners, modals, popups, and overlays
+          var adSelectors = [
+            '[class*="modal"]',
+            '[class*="popup"]',
+            '[class*="dialog"]',
+            '[class*="advertisement"]',
+            '[class*="promo"]',
+            '[class*="floating"]',
+            '[class*="banner-ad"]',
+            '[class*="ad-banner"]',
+            '[class*="backdrop"]',
+            '[class*="overlay"]',
+            '[id*="modal"]',
+            '[id*="popup"]',
+            '[id*="dialog"]',
+            '[id*="advertisement"]',
+            '[id*="promo"]',
+            '[id*="floating"]',
+            '[role="dialog"]',
+            '[role="alertdialog"]',
+            '.swal2-container'
+          ];
+          
+          adSelectors.forEach(function(sel) {
+            try {
+              var elements = clone.querySelectorAll(sel);
+              for (var i = 0; i < elements.length; i++) {
+                var el = elements[i];
+                var tag = el.tagName.toLowerCase();
+                if (tag !== 'header' && tag !== 'nav' && tag !== 'footer' && tag !== 'body' && tag !== 'html') {
+                  el.remove();
+                }
+              }
+            } catch(e) {}
+          });
+
+          // Also remove any fixed floating banner divs with high z-index
+          try {
+            var allDivs = clone.querySelectorAll('div, section, aside');
+            for (var j = 0; j < allDivs.length; j++) {
+              var d = allDivs[j];
+              var style = d.getAttribute('style') || '';
+              if ((style.includes('position: fixed') || style.includes('position:fixed')) &&
+                  (style.includes('z-index') || style.includes('z-index:'))) {
+                var tag = d.tagName.toLowerCase();
+                if (tag !== 'header' && tag !== 'nav' && tag !== 'footer') {
+                  d.remove();
+                }
+              }
+            }
+          } catch(e) {}
+
+          return clone.outerHTML;
+        })();
+      ''',
+      );
+
+      String html = '';
+      if (htmlResult is String) {
+        html = htmlResult;
+        // Clean outer JSON quotes if returned as serialized JSON string
+        if (html.startsWith('"') && html.endsWith('"')) {
+          try {
+            html = jsonDecode(html) as String;
+          } catch (_) {}
+        }
+      }
+
+      if (html.isNotEmpty && html.length > 500) {
+        final file = await _getCachedHomeFile();
+        if (file != null) {
+          await file.writeAsString(html, flush: true);
+          debugPrint(
+            "Mother's Hut: Clean home page snapshot saved locally (${html.length} bytes, popups/ads removed)",
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Error saving home page snapshot: $e');
+    }
+  }
+
+  /// Loads the saved local home page with an injected offline bar and action guard
+  Future<bool> _tryLoadOfflineHomePage() async {
+    try {
+      final file = await _getCachedHomeFile();
+      if (file != null && await file.exists()) {
+        String html = await file.readAsString();
+        if (html.length > 500) {
+          // Inject sticky offline indicator bar and action lock script
+          const offlineBannerAndScript = '''
+            <div id="mh-offline-bar" style="position:fixed; top:0; left:0; right:0; z-index:2147483647; background:linear-gradient(90deg, #8B4513 0%, #A0522D 100%); color:#ffffff; padding:10px 14px; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size:13px; font-weight:600; display:flex; align-items:center; justify-content:space-between; box-shadow:0 3px 10px rgba(0,0,0,0.25);">
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span style="font-size:15px;">⚡</span>
+                <span>Offline, please turn on internet</span>
+              </div>
+              <button onclick="if(window.MothersHutActionBridge) window.MothersHutActionBridge.postMessage('openWirelessSettings')" style="background:#ffffff; color:#8B4513; border:none; border-radius:6px; padding:5px 11px; font-size:11px; font-weight:700; cursor:pointer;">
+                Turn On Internet
+              </button>
+            </div>
+            <style>
+              body { padding-top: 44px !important; }
+              [class*="modal"], [class*="popup"], [class*="dialog"], [class*="advertisement"], [class*="promo"], [class*="backdrop"], [class*="overlay"], [id*="modal"], [id*="popup"], [id*="advertisement"] {
+                display: none !important;
+                visibility: hidden !important;
+                opacity: 0 !important;
+                pointer-events: none !important;
+              }
+            </style>
+            <script>
+              document.addEventListener('click', function(e) {
+                var target = e.target;
+                while (target && target.tagName !== 'BUTTON' && target.tagName !== 'A') {
+                  target = target.parentElement;
+                }
+                if (target && target.id !== 'mh-offline-bar-btn') {
+                  var text = (target.innerText || '').trim();
+                  var href = target.getAttribute('href') || '';
+                  if (text.length > 0 || href.length > 0) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (window.MothersHutActionBridge) {
+                      window.MothersHutActionBridge.postMessage('actionBlocked:' + (text || 'Order Action'));
+                    }
+                  }
+                }
+              }, true);
+            </script>
+          ''';
+
+          if (html.contains('</body>')) {
+            html = html.replaceFirst('</body>', '$offlineBannerAndScript</body>');
+          } else {
+            html = '$html$offlineBannerAndScript';
+          }
+
+          isOfflineModeNotifier.value = true;
+          hasErrorNotifier.value = false;
+          isLoadingNotifier.value = false;
+          if (isInitialLoadNotifier.value) {
+            isInitialLoadNotifier.value = false;
+          }
+
+          await controller.loadHtmlString(html, baseUrl: websiteUrl);
+          debugPrint(
+            "Mother's Hut: Rendered saved local home page in offline mode!",
+          );
+          return true;
+        }
+      }
+    } catch (e) {
+      debugPrint('Error loading offline home page: $e');
+    }
+    return false;
+  }
+
+  /// Show floating notice when an action button is clicked while offline
+  void _showOfflineActionNotice() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).clearSnackBars();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Row(
+          children: [
+            Icon(Icons.wifi_off_rounded, color: Colors.white, size: 20),
+            SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Internet connection required to order or proceed.',
+                style: TextStyle(color: Colors.white, fontSize: 13),
+              ),
+            ),
+          ],
+        ),
+        action: SnackBarAction(
+          label: 'SETTINGS',
+          textColor: const Color(0xFFFFD700),
+          onPressed: _openWirelessSettings,
+        ),
+        backgroundColor: const Color(0xFF8B4513),
+        duration: const Duration(seconds: 4),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+        ),
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+      ),
+    );
+  }
+
   /// Proactively inspect network connectivity on startup before loading
   Future<void> _checkInitialConnectivityAndLoad() async {
     try {
       final results = await Connectivity().checkConnectivity();
       final isConnected = results.any((r) => r != ConnectivityResult.none);
       if (!isConnected) {
-        hasErrorNotifier.value = true;
-        isLoadingNotifier.value = false;
-        if (isInitialLoadNotifier.value) {
-          isInitialLoadNotifier.value = false;
+        // Attempt to render the saved home page from local storage
+        final loaded = await _tryLoadOfflineHomePage();
+        if (!loaded) {
+          // Fallback to error UI only if no saved copy exists yet
+          hasErrorNotifier.value = true;
+          isLoadingNotifier.value = false;
+          if (isInitialLoadNotifier.value) {
+            isInitialLoadNotifier.value = false;
+          }
         }
       } else {
+        isOfflineModeNotifier.value = false;
         controller.loadRequest(Uri.parse(websiteUrl));
       }
     } catch (e) {
@@ -178,8 +403,11 @@ class _WebViewScreenState extends State<WebViewScreen> {
         (result) => result != ConnectivityResult.none,
       );
 
-      // Auto-recover when connectivity is restored
-      if (isConnected && hasErrorNotifier.value) {
+      // Auto-recover live site when connectivity is restored
+      if (isConnected &&
+          (hasErrorNotifier.value || isOfflineModeNotifier.value)) {
+        isOfflineModeNotifier.value = false;
+        hasErrorNotifier.value = false;
         retryLoading();
       }
     });
@@ -193,6 +421,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
     isInitialLoadNotifier.dispose();
     hasErrorNotifier.dispose();
     isRetryingNotifier.dispose();
+    isOfflineModeNotifier.dispose();
     super.dispose();
   }
 
@@ -213,6 +442,16 @@ class _WebViewScreenState extends State<WebViewScreen> {
         onMessageReceived: (JavaScriptMessage message) {
           if (message.message.isNotEmpty) {
             Clipboard.setData(ClipboardData(text: message.message));
+          }
+        },
+      )
+      ..addJavaScriptChannel(
+        'MothersHutActionBridge',
+        onMessageReceived: (JavaScriptMessage message) {
+          if (message.message == 'openWirelessSettings') {
+            _openWirelessSettings();
+          } else if (message.message.startsWith('actionBlocked:')) {
+            _showOfflineActionNotice();
           }
         },
       )
@@ -241,11 +480,17 @@ class _WebViewScreenState extends State<WebViewScreen> {
               isInitialLoadNotifier.value = false;
             }
 
-            // Bridge target="_blank" and window.open for reliable redirects and payment handling
+            // Bridge target="_blank", window.open, location hook, and clipboard
             _injectWindowBridge();
+
+            // When the live homepage finishes loading, capture a fresh offline snapshot
+            if (!isOfflineModeNotifier.value &&
+                (url == websiteUrl || url == '$websiteUrl/')) {
+              _saveHomePageSnapshot();
+            }
           },
 
-          onWebResourceError: (error) {
+          onWebResourceError: (error) async {
             debugPrint(
               "Mother's Hut onWebResourceError: [${error.errorCode}] ${error.description} (isForMainFrame: ${error.isForMainFrame})",
             );
@@ -263,8 +508,12 @@ class _WebViewScreenState extends State<WebViewScreen> {
                 description.contains('net::err_address_unreachable');
 
             if (error.isForMainFrame == true || isNetworkError) {
-              isLoadingNotifier.value = false;
-              hasErrorNotifier.value = true;
+              // Attempt to load the saved home page instead of showing raw error
+              final loaded = await _tryLoadOfflineHomePage();
+              if (!loaded) {
+                isLoadingNotifier.value = false;
+                hasErrorNotifier.value = true;
+              }
             }
           },
 
@@ -509,7 +758,9 @@ class _WebViewScreenState extends State<WebViewScreen> {
       final isConnected = results.any((r) => r != ConnectivityResult.none);
 
       if (!isConnected) {
-        if (mounted) {
+        // Attempt to render the saved home page if offline
+        final loaded = await _tryLoadOfflineHomePage();
+        if (!loaded && mounted) {
           ScaffoldMessenger.of(context).clearSnackBars();
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -530,6 +781,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
         return;
       }
 
+      isOfflineModeNotifier.value = false;
       hasErrorNotifier.value = false;
       isLoadingNotifier.value = true;
       progressNotifier.value = 0;
@@ -782,7 +1034,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
               return Stack(
                 fit: StackFit.expand,
                 children: [
-                  // 1. Primary WebView with Hybrid Composition - completely hidden when offline so Chromium's raw error never appears
+                  // 1. Primary WebView with Hybrid Composition - renders live site or saved offline home page
                   Offstage(
                     offstage: hasError,
                     child: _buildWebView(),
@@ -799,7 +1051,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
                     },
                   ),
 
-                  // 3. Smart, Branded Offline Interface
+                  // 3. Fallback Offline Interface (Shown only if no offline home page was ever cached)
                   if (hasError)
                     Positioned.fill(
                       child: _buildOfflineInterface(),
