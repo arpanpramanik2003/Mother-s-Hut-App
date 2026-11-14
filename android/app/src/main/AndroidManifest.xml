@@ -79,6 +79,9 @@
         <package android:name="net.one97.paytm" />
         <package android:name="in.amazon.mShop.android.shopping" />
         <package android:name="in.org.npci.upiapp" />
+        <!-- Google Maps & Chrome -->
+        <package android:name="com.google.android.apps.maps" />
+        <package android:name="com.android.chrome" />
         <!-- WhatsApp & WhatsApp Business -->
         <package android:name="com.whatsapp" />
         <package android:name="com.whatsapp.w4b" />

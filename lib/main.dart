@@ -65,6 +65,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
     'gpay',
   };
   static const List<String> _chatHosts = ['wa.me', 'whatsapp.com'];
+  static const List<String> _reviewHosts = [
+    'g.page',
+    'search.google.com',
+    'business.google.com',
+    'maps.google.',
+    'goo.gl',
+    'maps.app.goo.gl',
+  ];
   static const List<String> _mapHosts = [
     'maps.google.',
     'goo.gl',
@@ -187,6 +195,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
           }
         },
       )
+      ..addJavaScriptChannel(
+        'MothersHutClipboardBridge',
+        onMessageReceived: (JavaScriptMessage message) {
+          if (message.message.isNotEmpty) {
+            Clipboard.setData(ClipboardData(text: message.message));
+          }
+        },
+      )
       ..setNavigationDelegate(
         NavigationDelegate(
           onProgress: (value) {
@@ -306,6 +322,20 @@ class _WebViewScreenState extends State<WebViewScreen> {
           };
         }
 
+        // Bridge clipboard writeText to native Flutter Clipboard for 100% reliable copying
+        if (navigator.clipboard && !window.__mhClipHooked) {
+          window.__mhClipHooked = true;
+          var origClip = navigator.clipboard.writeText.bind(navigator.clipboard);
+          navigator.clipboard.writeText = function(text) {
+            try {
+              if (window.MothersHutClipboardBridge) {
+                window.MothersHutClipboardBridge.postMessage(text);
+              }
+            } catch(e) {}
+            return origClip(text);
+          };
+        }
+
         // Redirect window.open to location.href for Flutter intent interception
         window.open = function(url) {
           if (url) {
@@ -364,13 +394,32 @@ class _WebViewScreenState extends State<WebViewScreen> {
       return NavigationDecision.prevent;
     }
 
-    // 4. Google Maps & Navigation
+    // 4. Google Reviews & Ratings (Opens in native Google Maps or Chrome where user is already logged in)
+    final isGoogleReview = _reviewHosts.any((h) => host.contains(h)) ||
+        (host.contains('google.') &&
+            (uri.path.contains('review') ||
+                uri.path.contains('maps') ||
+                uri.path.contains('place') ||
+                uri.queryParameters.containsKey('placeid') ||
+                uri.queryParameters.containsKey('lrd') ||
+                uri.fragment.contains('lrd')));
+
+    if (isGoogleReview) {
+      _launchExternalUrl(
+        uri,
+        'Google Review',
+        mode: LaunchMode.externalApplication,
+      );
+      return NavigationDecision.prevent;
+    }
+
+    // 5. Google Maps & Direct Navigation
     if (_mapHosts.any((h) => host.contains(h))) {
       _launchExternalUrl(uri, 'Maps', mode: LaunchMode.externalApplication);
       return NavigationDecision.prevent;
     }
 
-    // 5. Social media platforms (open in native apps if installed)
+    // 6. Social media platforms (open in native apps if installed)
     if (_socialHosts.any((h) => host.contains(h))) {
       _launchExternalUrl(
         uri,
