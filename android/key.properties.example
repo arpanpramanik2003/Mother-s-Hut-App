@@ -1,0 +1,8 @@
+# Mother's Hut Android Release Signing Configuration Template
+# Copy this file to android/key.properties and replace with your actual keystore details
+# NEVER commit key.properties or .jks keystore files to public version control!
+
+keyAlias=mothers_hut_key
+keyPassword=your_keystore_key_password
+storeFile=../mothers_hut_release.jks
+storePassword=your_keystore_password
