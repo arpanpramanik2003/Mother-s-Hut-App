@@ -4,9 +4,7 @@ import 'package:shimmer/shimmer.dart';
 /// A native skeleton loader widget matching the layout of Mother's Hut.
 /// Displays a branded shimmering placeholder while the web content is loading on initial launch.
 class SkeletonLoader extends StatelessWidget {
-  final int progress;
-
-  const SkeletonLoader({super.key, this.progress = 0});
+  const SkeletonLoader({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -15,34 +13,17 @@ class SkeletonLoader extends StatelessWidget {
 
     return Container(
       color: Colors.white,
-      child: Column(
-        children: [
-          // Top Progress Indicator
-          if (progress > 0 && progress < 100)
-            LinearProgressIndicator(
-              value: progress / 100,
-              backgroundColor: Colors.grey.shade100,
-              valueColor: const AlwaysStoppedAnimation<Color>(
-                Color(0xFF8B4513),
-              ),
-              minHeight: 3,
-            )
-          else
-            const SizedBox(height: 3),
-
-          // Skeleton Content
-          Expanded(
-            child: Shimmer.fromColors(
-              baseColor: baseColor,
-              highlightColor: highlightColor,
-              child: SingleChildScrollView(
-                physics: const NeverScrollableScrollPhysics(),
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 12,
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+      child: Shimmer.fromColors(
+        baseColor: baseColor,
+        highlightColor: highlightColor,
+        child: SingleChildScrollView(
+          physics: const NeverScrollableScrollPhysics(),
+          padding: const EdgeInsets.symmetric(
+            horizontal: 16,
+            vertical: 12,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     // Top App Header Placeholder
                     Row(
@@ -194,9 +175,6 @@ class SkeletonLoader extends StatelessWidget {
                 ),
               ),
             ),
-          ),
-        ],
-      ),
     );
   }
 

@@ -132,12 +132,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
           },
 
           onPageStarted: (url) {
+            debugPrint("Mother's Hut onPageStarted: $url");
             progressNotifier.value = 0;
             isLoadingNotifier.value = true;
             hasErrorNotifier.value = false;
           },
 
           onPageFinished: (url) {
+            debugPrint("Mother's Hut onPageFinished: $url");
             progressNotifier.value = 100;
             isLoadingNotifier.value = false;
             hasErrorNotifier.value = false;
@@ -150,6 +152,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
           },
 
           onWebResourceError: (error) {
+            debugPrint("Mother's Hut onWebResourceError: [${error.errorCode}] ${error.description} (isForMainFrame: ${error.isForMainFrame})");
             // Only show the error screen when the main website frame fails.
             if (error.isForMainFrame == false) return;
 
@@ -166,7 +169,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
     controller.loadRequest(Uri.parse(websiteUrl));
   }
 
-  void _configurePlatformCapabilities() async {
+  void _configurePlatformCapabilities() {
     if (controller.platform is AndroidWebViewController) {
       final androidController = controller.platform as AndroidWebViewController;
 
@@ -183,30 +186,17 @@ class _WebViewScreenState extends State<WebViewScreen> {
         ),
       );
 
-      // Auto-grant protected web resource permissions (camera, microphone)
-      androidController.setOnPlatformPermissionRequest(
-        (request) => request.grant(),
-      );
-
       // Media playback without requiring physical gesture
       androidController.setMediaPlaybackRequiresUserGesture(false);
-
-      // Clean User-Agent: Strip '; wv' to prevent Google Auth / Cloudflare blocks
-      try {
-        final currentUa = await controller.getUserAgent();
-        if (currentUa != null && currentUa.contains('; wv')) {
-          final cleanUa = currentUa.replaceAll('; wv', '');
-          await controller.setUserAgent(cleanUa);
-        }
-      } catch (e) {
-        debugPrint('Could not sanitize User-Agent: $e');
-      }
     }
   }
 
   void _injectWindowBridge() {
     controller.runJavaScript('''
       (function() {
+        if (window.__mhBridgeInjected) return;
+        window.__mhBridgeInjected = true;
+
         // Redirect window.open to location.href for Flutter intent interception
         window.open = function(url) {
           if (url) {
@@ -215,21 +205,18 @@ class _WebViewScreenState extends State<WebViewScreen> {
           return window;
         };
 
-        // Convert target="_blank" anchors to target="_self"
-        function fixBlankTargets() {
-          var links = document.getElementsByTagName('a');
-          for (var i = 0; i < links.length; i++) {
-            if (links[i].getAttribute('target') === '_blank') {
-              links[i].setAttribute('target', '_self');
+        // Event delegation: Intercept target="_blank" links dynamically with 0% CPU overhead
+        document.addEventListener('click', function(e) {
+          var target = e.target;
+          while (target && target.tagName !== 'A') {
+            target = target.parentElement;
+          }
+          if (target && target.tagName === 'A') {
+            if (target.getAttribute('target') === '_blank') {
+              target.setAttribute('target', '_self');
             }
           }
-        }
-        fixBlankTargets();
-
-        // Observe DOM for dynamically rendered links (React, Vue, SPA, modals)
-        if (window.MutationObserver) {
-          new MutationObserver(fixBlankTargets).observe(document.body, { childList: true, subtree: true });
-        }
+        }, true);
       })();
     ''').catchError((e) {
       debugPrint('Error injecting window bridge: $e');
@@ -397,45 +384,38 @@ class _WebViewScreenState extends State<WebViewScreen> {
         backgroundColor: Colors.white,
         body: SafeArea(
           child: Stack(
+            fit: StackFit.expand,
             children: [
-              // Native WebView with direct touch handling (zero gesture-arena fighting)
+              // 1. Primary WebView - Full, tight, non-empty bounds (fixes '!size.isEmpty' assertion)
+              WebViewWidget(
+                controller: controller,
+              ),
+
+              // 2. Full-Screen Skeleton Loader shown ONLY on Initial Cold Start
               Positioned.fill(
-                child: WebViewWidget(
-                  controller: controller,
+                child: ValueListenableBuilder<bool>(
+                  valueListenable: hasErrorNotifier,
+                  builder: (context, hasError, _) {
+                    if (hasError) return const SizedBox.shrink();
+                    return ValueListenableBuilder<bool>(
+                      valueListenable: isInitialLoadNotifier,
+                      builder: (context, isInitialLoad, _) {
+                        return IgnorePointer(
+                          ignoring: !isInitialLoad,
+                          child: AnimatedOpacity(
+                            opacity: isInitialLoad ? 1.0 : 0.0,
+                            duration: const Duration(milliseconds: 350),
+                            curve: Curves.easeOut,
+                            child: const SkeletonLoader(),
+                          ),
+                        );
+                      },
+                    );
+                  },
                 ),
               ),
 
-              // Full-Screen Skeleton Loader shown ONLY on Initial Cold Start
-              ValueListenableBuilder<bool>(
-                valueListenable: hasErrorNotifier,
-                builder: (context, hasError, _) {
-                  if (hasError) return const SizedBox.shrink();
-                  return ValueListenableBuilder<bool>(
-                    valueListenable: isInitialLoadNotifier,
-                    builder: (context, isInitialLoad, _) {
-                      return IgnorePointer(
-                        ignoring: !isInitialLoad,
-                        child: AnimatedOpacity(
-                          opacity: isInitialLoad ? 1.0 : 0.0,
-                          duration: const Duration(milliseconds: 300),
-                          child: isInitialLoad
-                              ? ValueListenableBuilder<int>(
-                                  valueListenable: progressNotifier,
-                                  builder: (context, progress, _) {
-                                    return SkeletonLoader(
-                                      progress: progress,
-                                    );
-                                  },
-                                )
-                              : const SizedBox.shrink(),
-                        ),
-                      );
-                    },
-                  );
-                },
-              ),
-
-              // Sleek, Branded Top Progress Bar for In-Page Route Navigations
+              // 3. Sleek, Branded Top Progress Bar for In-Page Route Navigations
               Positioned(
                 top: 0,
                 left: 0,
@@ -481,98 +461,100 @@ class _WebViewScreenState extends State<WebViewScreen> {
                 ),
               ),
 
-              // Enhanced Branded Offline / Error Screen
-              ValueListenableBuilder<bool>(
-                valueListenable: hasErrorNotifier,
-                builder: (context, hasError, _) {
-                  if (!hasError) return const SizedBox.shrink();
-                  return Container(
-                  color: Colors.white,
-                  width: double.infinity,
-                  height: double.infinity,
-                  child: Center(
-                    child: SingleChildScrollView(
-                      padding: const EdgeInsets.all(28),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(18),
-                            child: Image.asset(
-                              'assets/images/mothers_hut_logo.png',
-                              width: 90,
-                              height: 90,
-                              fit: BoxFit.contain,
-                              errorBuilder: (context, error, stackTrace) =>
-                                  Container(
-                                    width: 90,
-                                    height: 90,
-                                    decoration: BoxDecoration(
-                                      color: const Color(
-                                        0xFF8B4513,
-                                      ).withValues(alpha: 0.1),
-                                      shape: BoxShape.circle,
-                                    ),
-                                    child: const Icon(
-                                      Icons.wifi_off_rounded,
-                                      size: 48,
-                                      color: Color(0xFF8B4513),
-                                    ),
+              // 4. Enhanced Branded Offline / Error Screen
+              Positioned.fill(
+                child: ValueListenableBuilder<bool>(
+                  valueListenable: hasErrorNotifier,
+                  builder: (context, hasError, _) {
+                    if (!hasError) return const SizedBox.shrink();
+                    return Container(
+                      color: Colors.white,
+                      width: double.infinity,
+                      height: double.infinity,
+                      child: Center(
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.all(28),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(18),
+                                child: Image.asset(
+                                  'assets/images/mothers_hut_logo.png',
+                                  width: 90,
+                                  height: 90,
+                                  fit: BoxFit.contain,
+                                  errorBuilder: (context, error, stackTrace) =>
+                                      Container(
+                                        width: 90,
+                                        height: 90,
+                                        decoration: BoxDecoration(
+                                          color: const Color(
+                                            0xFF8B4513,
+                                          ).withValues(alpha: 0.1),
+                                          shape: BoxShape.circle,
+                                        ),
+                                        child: const Icon(
+                                          Icons.wifi_off_rounded,
+                                          size: 48,
+                                          color: Color(0xFF8B4513),
+                                        ),
+                                      ),
+                                ),
+                              ),
+
+                              const SizedBox(height: 24),
+
+                              const Text(
+                                'Connection Problem',
+                                style: TextStyle(
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.bold,
+                                  color: Color(0xFF222222),
+                                ),
+                              ),
+
+                              const SizedBox(height: 10),
+
+                              const Text(
+                                'Unable to connect to Mother\'s Hut.\n'
+                                'Please check your internet connection. The app will auto-reconnect once back online.',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  color: Colors.black54,
+                                  height: 1.4,
+                                ),
+                              ),
+
+                              const SizedBox(height: 28),
+
+                              ElevatedButton.icon(
+                                onPressed: retryLoading,
+                                icon: const Icon(Icons.refresh_rounded),
+                                label: const Text('Try Again'),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF8B4513),
+                                  foregroundColor: Colors.white,
+                                  elevation: 2,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
                                   ),
-                            ),
-                          ),
-
-                          const SizedBox(height: 24),
-
-                          const Text(
-                            'Connection Problem',
-                            style: TextStyle(
-                              fontSize: 22,
-                              fontWeight: FontWeight.bold,
-                              color: Color(0xFF222222),
-                            ),
-                          ),
-
-                          const SizedBox(height: 10),
-
-                          const Text(
-                            'Unable to connect to Mother\'s Hut.\n'
-                            'Please check your internet connection. The app will auto-reconnect once back online.',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: Colors.black54,
-                              height: 1.4,
-                            ),
-                          ),
-
-                          const SizedBox(height: 28),
-
-                          ElevatedButton.icon(
-                            onPressed: retryLoading,
-                            icon: const Icon(Icons.refresh_rounded),
-                            label: const Text('Try Again'),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF8B4513),
-                              foregroundColor: Colors.white,
-                              elevation: 2,
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(12),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 32,
+                                    vertical: 14,
+                                  ),
+                                ),
                               ),
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 32,
-                                vertical: 14,
-                              ),
-                            ),
+                            ],
                           ),
-                        ],
+                        ),
                       ),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ],
+                    );
+                  },
+                ),
+              ),
+            ],
           ),
         ),
       ),
