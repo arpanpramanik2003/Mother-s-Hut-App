@@ -52,6 +52,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
   final ValueNotifier<int> progressNotifier = ValueNotifier<int>(0);
   final ValueNotifier<bool> isLoadingNotifier = ValueNotifier<bool>(true);
+  final ValueNotifier<bool> isInitialLoadNotifier = ValueNotifier<bool>(true);
   final ValueNotifier<bool> hasErrorNotifier = ValueNotifier<bool>(false);
 
   DateTime? _lastBackPressed;
@@ -87,6 +88,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
     _connectivitySubscription?.cancel();
     progressNotifier.dispose();
     isLoadingNotifier.dispose();
+    isInitialLoadNotifier.dispose();
     hasErrorNotifier.dispose();
     super.dispose();
   }
@@ -114,6 +116,9 @@ class _WebViewScreenState extends State<WebViewScreen> {
             progressNotifier.value = 100;
             isLoadingNotifier.value = false;
             hasErrorNotifier.value = false;
+            if (isInitialLoadNotifier.value) {
+              isInitialLoadNotifier.value = false;
+            }
           },
 
           onWebResourceError: (error) {
@@ -285,33 +290,80 @@ class _WebViewScreenState extends State<WebViewScreen> {
                 ),
               ),
 
-              // Skeleton loading indicator isolated via ValueListenable
+              // Full-Screen Skeleton Loader shown ONLY on Initial Cold Start
               ValueListenableBuilder<bool>(
                 valueListenable: hasErrorNotifier,
                 builder: (context, hasError, _) {
                   if (hasError) return const SizedBox.shrink();
                   return ValueListenableBuilder<bool>(
-                    valueListenable: isLoadingNotifier,
-                    builder: (context, isLoading, _) {
-                      return AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 350),
-                        child: isLoading
-                            ? ValueListenableBuilder<int>(
-                                valueListenable: progressNotifier,
-                                builder: (context, progress, _) {
-                                  return SkeletonLoader(
-                                    key: const ValueKey('skeleton_loader'),
-                                    progress: progress,
-                                  );
-                                },
-                              )
-                            : const SizedBox.shrink(
-                                key: ValueKey('empty_space'),
-                              ),
+                    valueListenable: isInitialLoadNotifier,
+                    builder: (context, isInitialLoad, _) {
+                      return IgnorePointer(
+                        ignoring: !isInitialLoad,
+                        child: AnimatedOpacity(
+                          opacity: isInitialLoad ? 1.0 : 0.0,
+                          duration: const Duration(milliseconds: 300),
+                          child: isInitialLoad
+                              ? ValueListenableBuilder<int>(
+                                  valueListenable: progressNotifier,
+                                  builder: (context, progress, _) {
+                                    return SkeletonLoader(
+                                      progress: progress,
+                                    );
+                                  },
+                                )
+                              : const SizedBox.shrink(),
+                        ),
                       );
                     },
                   );
                 },
+              ),
+
+              // Sleek, Branded Top Progress Bar for In-Page Route Navigations
+              Positioned(
+                top: 0,
+                left: 0,
+                right: 0,
+                child: ValueListenableBuilder<bool>(
+                  valueListenable: hasErrorNotifier,
+                  builder: (context, hasError, _) {
+                    if (hasError) return const SizedBox.shrink();
+                    return ValueListenableBuilder<bool>(
+                      valueListenable: isInitialLoadNotifier,
+                      builder: (context, isInitialLoad, _) {
+                        if (isInitialLoad) return const SizedBox.shrink();
+                        return ValueListenableBuilder<bool>(
+                          valueListenable: isLoadingNotifier,
+                          builder: (context, isLoading, _) {
+                            return ValueListenableBuilder<int>(
+                              valueListenable: progressNotifier,
+                              builder: (context, progress, _) {
+                                final isVisible =
+                                    isLoading && progress > 0 && progress < 100;
+                                return AnimatedOpacity(
+                                  opacity: isVisible ? 1.0 : 0.0,
+                                  duration: const Duration(milliseconds: 180),
+                                  child: isVisible
+                                      ? LinearProgressIndicator(
+                                          value: progress / 100.0,
+                                          backgroundColor: Colors.transparent,
+                                          valueColor:
+                                              const AlwaysStoppedAnimation<Color>(
+                                                Color(0xFF8B4513),
+                                              ),
+                                          minHeight: 2.5,
+                                        )
+                                      : const SizedBox(height: 2.5),
+                                );
+                              },
+                            );
+                          },
+                        );
+                      },
+                    );
+                  },
+                ),
               ),
 
               // Enhanced Branded Offline / Error Screen
