@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -51,9 +50,9 @@ class WebViewScreen extends StatefulWidget {
 class _WebViewScreenState extends State<WebViewScreen> {
   late final WebViewController controller;
 
-  int progress = 0;
-  bool isLoading = true;
-  bool hasError = false;
+  final ValueNotifier<int> progressNotifier = ValueNotifier<int>(0);
+  final ValueNotifier<bool> isLoadingNotifier = ValueNotifier<bool>(true);
+  final ValueNotifier<bool> hasErrorNotifier = ValueNotifier<bool>(false);
 
   DateTime? _lastBackPressed;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
@@ -77,7 +76,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
       );
 
       // Auto-recover when connectivity is restored
-      if (isConnected && hasError) {
+      if (isConnected && hasErrorNotifier.value) {
         retryLoading();
       }
     });
@@ -86,6 +85,9 @@ class _WebViewScreenState extends State<WebViewScreen> {
   @override
   void dispose() {
     _connectivitySubscription?.cancel();
+    progressNotifier.dispose();
+    isLoadingNotifier.dispose();
+    hasErrorNotifier.dispose();
     super.dispose();
   }
 
@@ -96,44 +98,30 @@ class _WebViewScreenState extends State<WebViewScreen> {
       ..setNavigationDelegate(
         NavigationDelegate(
           onProgress: (value) {
-            if (!mounted) return;
-
-            setState(() {
-              progress = value;
-              isLoading = value < 100;
-            });
+            progressNotifier.value = value;
+            if (value >= 100 && isLoadingNotifier.value) {
+              isLoadingNotifier.value = false;
+            }
           },
 
           onPageStarted: (url) {
-            if (!mounted) return;
-
-            setState(() {
-              isLoading = true;
-              hasError = false;
-              progress = 0;
-            });
+            progressNotifier.value = 0;
+            isLoadingNotifier.value = true;
+            hasErrorNotifier.value = false;
           },
 
           onPageFinished: (url) {
-            if (!mounted) return;
-
-            setState(() {
-              isLoading = false;
-              progress = 100;
-              hasError = false;
-            });
+            progressNotifier.value = 100;
+            isLoadingNotifier.value = false;
+            hasErrorNotifier.value = false;
           },
 
           onWebResourceError: (error) {
             // Only show the error screen when the main website frame fails.
             if (error.isForMainFrame == false) return;
 
-            if (!mounted) return;
-
-            setState(() {
-              isLoading = false;
-              hasError = true;
-            });
+            isLoadingNotifier.value = false;
+            hasErrorNotifier.value = true;
           },
 
           onNavigationRequest: _handleNavigationRequest,
@@ -236,11 +224,9 @@ class _WebViewScreenState extends State<WebViewScreen> {
   }
 
   Future<void> retryLoading() async {
-    setState(() {
-      hasError = false;
-      isLoading = true;
-      progress = 0;
-    });
+    hasErrorNotifier.value = false;
+    isLoadingNotifier.value = true;
+    progressNotifier.value = 0;
 
     await controller.reload();
   }
@@ -292,47 +278,48 @@ class _WebViewScreenState extends State<WebViewScreen> {
         body: SafeArea(
           child: Stack(
             children: [
-              // Pull-To-Refresh integrated WebView
-              RefreshIndicator(
-                color: const Color(0xFF8B4513),
-                backgroundColor: Colors.white,
-                onRefresh: () async {
-                  await controller.reload();
-                },
-                child: SingleChildScrollView(
-                  physics: const AlwaysScrollableScrollPhysics(),
-                  child: SizedBox(
-                    height:
-                        MediaQuery.of(context).size.height -
-                        MediaQuery.of(context).padding.top -
-                        MediaQuery.of(context).padding.bottom,
-                    child: WebViewWidget(
-                      controller: controller,
-                      gestureRecognizers:
-                          <Factory<OneSequenceGestureRecognizer>>{
-                            Factory<VerticalDragGestureRecognizer>(
-                              () => VerticalDragGestureRecognizer(),
-                            ),
-                          },
-                    ),
-                  ),
+              // Native WebView with direct touch handling (zero gesture-arena fighting)
+              Positioned.fill(
+                child: WebViewWidget(
+                  controller: controller,
                 ),
               ),
 
-              // Skeleton loading indicator with smooth fade animation
-              AnimatedSwitcher(
-                duration: const Duration(milliseconds: 350),
-                child: (isLoading && !hasError)
-                    ? SkeletonLoader(
-                        key: const ValueKey('skeleton_loader'),
-                        progress: progress,
-                      )
-                    : const SizedBox.shrink(key: ValueKey('empty_space')),
+              // Skeleton loading indicator isolated via ValueListenable
+              ValueListenableBuilder<bool>(
+                valueListenable: hasErrorNotifier,
+                builder: (context, hasError, _) {
+                  if (hasError) return const SizedBox.shrink();
+                  return ValueListenableBuilder<bool>(
+                    valueListenable: isLoadingNotifier,
+                    builder: (context, isLoading, _) {
+                      return AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 350),
+                        child: isLoading
+                            ? ValueListenableBuilder<int>(
+                                valueListenable: progressNotifier,
+                                builder: (context, progress, _) {
+                                  return SkeletonLoader(
+                                    key: const ValueKey('skeleton_loader'),
+                                    progress: progress,
+                                  );
+                                },
+                              )
+                            : const SizedBox.shrink(
+                                key: ValueKey('empty_space'),
+                              ),
+                      );
+                    },
+                  );
+                },
               ),
 
               // Enhanced Branded Offline / Error Screen
-              if (hasError)
-                Container(
+              ValueListenableBuilder<bool>(
+                valueListenable: hasErrorNotifier,
+                builder: (context, hasError, _) {
+                  if (!hasError) return const SizedBox.shrink();
+                  return Container(
                   color: Colors.white,
                   width: double.infinity,
                   height: double.infinity,
@@ -415,8 +402,10 @@ class _WebViewScreenState extends State<WebViewScreen> {
                       ),
                     ),
                   ),
-                ),
-            ],
+                );
+              },
+            ),
+          ],
           ),
         ),
       ),
