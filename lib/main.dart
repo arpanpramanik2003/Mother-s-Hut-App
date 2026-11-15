@@ -415,36 +415,120 @@ class _WebViewScreenState extends State<WebViewScreen> {
     return false;
   }
 
-  /// Show floating notice when an action button is clicked while offline
-  void _showOfflineActionNotice() {
+  /// Show a beautiful, native modal sheet whenever a user clicks while offline
+  void _showOfflineActionNotice({String? message}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).clearSnackBars();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: const Row(
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (sheetContext) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black26,
+              blurRadius: 20,
+              offset: Offset(0, -4),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.wifi_off_rounded, color: Colors.white, size: 20),
-            SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                'Internet connection required to order or proceed.',
-                style: TextStyle(color: Colors.white, fontSize: 13),
+            // Handle bar
+            Container(
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Colors.black12,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 20),
+
+            // Icon with warm brand background
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: const Color(0xFF8B4513).withValues(alpha: 0.08),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(
+                Icons.wifi_off_rounded,
+                color: Color(0xFF8B4513),
+                size: 38,
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            // Title
+            const Text(
+              'No Internet Connection',
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+                color: Color(0xFF1F2937),
+                letterSpacing: -0.3,
+              ),
+            ),
+            const SizedBox(height: 10),
+
+            // Description
+            Text(
+              message ??
+                  'Please turn on Wi-Fi or Mobile Data to view dishes, place orders, and proceed with Mother\'s Hut.',
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontSize: 14,
+                color: Colors.black54,
+                height: 1.45,
+              ),
+            ),
+            const SizedBox(height: 24),
+
+            // Primary Button: Turn On Internet
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: () {
+                  Navigator.pop(sheetContext);
+                  _openWirelessSettings();
+                },
+                icon: const Icon(Icons.settings_outlined, size: 20),
+                label: const Text(
+                  'Turn On Internet',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                ),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF8B4513),
+                  foregroundColor: Colors.white,
+                  elevation: 1,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+
+            // Secondary Button: Dismiss
+            TextButton(
+              onPressed: () => Navigator.pop(sheetContext),
+              child: const Text(
+                'Dismiss',
+                style: TextStyle(
+                  color: Colors.black45,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 14,
+                ),
               ),
             ),
           ],
         ),
-        action: SnackBarAction(
-          label: 'SETTINGS',
-          textColor: const Color(0xFFFFD700),
-          onPressed: _openWirelessSettings,
-        ),
-        backgroundColor: const Color(0xFF8B4513),
-        duration: const Duration(seconds: 4),
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(10),
-        ),
-        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
       ),
     );
   }
@@ -582,6 +666,10 @@ class _WebViewScreenState extends State<WebViewScreen> {
             _openWirelessSettings();
           } else if (message.message.startsWith('actionBlocked:')) {
             _showOfflineActionNotice();
+          } else if (message.message == 'offlineClick') {
+            _showOfflineActionNotice();
+          } else if (message.message == 'networkLost') {
+            hasErrorNotifier.value = true;
           }
         },
       )
@@ -762,6 +850,31 @@ class _WebViewScreenState extends State<WebViewScreen> {
           return window;
         };
 
+        // Intercept all user clicks when offline: prevent navigation and show Flutter offline bottom sheet
+        document.addEventListener('click', function(e) {
+          if (!navigator.onLine) {
+            var target = e.target;
+            while (target && target.tagName !== 'BUTTON' && target.tagName !== 'A' && !target.onclick && target.getAttribute('role') !== 'button') {
+              target = target.parentElement;
+            }
+            if (target) {
+              e.preventDefault();
+              e.stopImmediatePropagation();
+              if (window.MothersHutActionBridge) {
+                window.MothersHutActionBridge.postMessage('offlineClick');
+              }
+              return false;
+            }
+          }
+        }, true);
+
+        // Native offline event in DOM
+        window.addEventListener('offline', function() {
+          if (window.MothersHutActionBridge) {
+            window.MothersHutActionBridge.postMessage('networkLost');
+          }
+        });
+
         // Event delegation: Intercept target="_blank" links dynamically with 0% CPU overhead
         document.addEventListener('click', function(e) {
           var target = e.target;
@@ -785,6 +898,15 @@ class _WebViewScreenState extends State<WebViewScreen> {
   ) async {
     final uri = Uri.tryParse(request.url);
     if (uri == null) return NavigationDecision.prevent;
+
+    // CRITICAL: Block any navigation attempt if offline to prevent Chromium "Web page not available"
+    final results = await Connectivity().checkConnectivity();
+    final isConnected = results.any((r) => r != ConnectivityResult.none);
+    if (!isConnected) {
+      debugPrint("Mother's Hut: Navigation blocked while offline -> Showing offline modal");
+      _showOfflineActionNotice();
+      return NavigationDecision.prevent;
+    }
 
     final scheme = uri.scheme.toLowerCase();
     final host = uri.host.toLowerCase();
